@@ -830,6 +830,12 @@ class SpeculativeConfig:
                     )
                 self.draft_model_config = ModelConfig(
                     model=self.model,
+                    model_weights=(
+                        self.target_model_config.model_weights
+                        if self.method in ("mtp", "dspark")
+                        and self.model == self.target_model_config.model
+                        else ""
+                    ),
                     runner="draft",
                     tokenizer=(
                         self.model

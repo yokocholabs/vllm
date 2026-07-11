@@ -61,6 +61,28 @@ def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
     return EagleProposer(vllm_config=vllm_config, device=DEVICE_TYPE)
 
 
+@pytest.mark.cpu_test
+def test_mtp_reuses_target_model_weights():
+    model_weights = "/models/glm.gguf"
+    model_config = ModelConfig(
+        model=mimo_7b_dir,
+        model_weights=model_weights,
+        runner="generate",
+        max_model_len=100,
+        trust_remote_code=True,
+    )
+
+    speculative_config = SpeculativeConfig(
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(),
+        method="mtp",
+        num_speculative_tokens=1,
+    )
+
+    assert speculative_config.draft_model_config.model == model_config.model
+    assert speculative_config.draft_model_config.model_weights == model_weights
+
+
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_pp_group")
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_layers_from_vllm_config")
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_model")
