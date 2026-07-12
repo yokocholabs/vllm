@@ -40,6 +40,33 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
+_STREAMING_WEIGHT_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _copy_weight_with_bounded_mmap_window(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    release_callback=None,
+) -> None:
+    """Copy a GGUF mmap view in bounded chunks and evict consumed pages."""
+    if release_callback is None or source.ndim == 0 or source.shape[0] == 0:
+        destination.copy_(source)
+        if release_callback is not None:
+            release_callback()
+        return
+
+    row_span_bytes = source.stride(0) * source.element_size()
+    rows_per_chunk = max(
+        1, _STREAMING_WEIGHT_CHUNK_BYTES // max(row_span_bytes, 1)
+    )
+    for start in range(0, source.shape[0], rows_per_chunk):
+        rows = min(rows_per_chunk, source.shape[0] - start)
+        destination.narrow(0, start, rows).copy_(
+            source.narrow(0, start, rows)
+        )
+        release_callback()
+
+
 @PluggableLayer.register("routed_experts")
 class RoutedExperts(PluggableLayer):
     """
@@ -454,6 +481,9 @@ class RoutedExperts(PluggableLayer):
         tp_rank: int,
         load_full: bool = False,
     ):
+        release_callback = getattr(
+            loaded_weight, "_gguf_mmap_release", None
+        )
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         if self.moe_config.is_act_and_mul:
@@ -494,7 +524,11 @@ class RoutedExperts(PluggableLayer):
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        _copy_weight_with_bounded_mmap_window(
+            expert_data,
+            loaded_weight,
+            release_callback,
+        )
 
     def _load_w2(
         self,
@@ -504,6 +538,9 @@ class RoutedExperts(PluggableLayer):
         tp_rank: int,
         load_full: bool = False,
     ):
+        release_callback = getattr(
+            loaded_weight, "_gguf_mmap_release", None
+        )
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
@@ -529,7 +566,11 @@ class RoutedExperts(PluggableLayer):
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        _copy_weight_with_bounded_mmap_window(
+            expert_data,
+            loaded_weight,
+            release_callback,
+        )
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
