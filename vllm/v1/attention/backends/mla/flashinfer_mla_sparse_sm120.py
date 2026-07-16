@@ -12,11 +12,13 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+    FlashInferMLASparseImpl,
     FlashInferMLASparseMetadata,
     _get_workspace_buffer,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
+    triton_filter_and_convert_dcp_index,
 )
 
 if TYPE_CHECKING:
@@ -33,6 +35,11 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
     """SM120 FlashInfer sparse-MLA implementation."""
 
     is_sparse = True
+
+    # trtllm-gen returns base-2 LSE; the shared DCP combine branches on
+    # lse_base_on_e.
+    can_return_lse_for_decode = True
+    lse_base_on_e = False
 
     def __init__(
         self,
@@ -117,6 +124,70 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
+        if self._workspace_buffer is None:
+            self._workspace_buffer = _get_workspace_buffer(q.device)
+
+        from vllm.utils.flashinfer import (
+            flashinfer_trtllm_batch_decode_with_kv_cache_mla,
+        )
+
+        if self.dcp_world_size > 1:
+            # Filter the logical top-k indices down to the entries this DCP
+            # rank owns and convert them against the local block table;
+            # seq_lens carries the per-token count of surviving entries. The
+            # query arrives all-gathered across DCP ranks, so the kernel
+            # sizes the output from the runtime query shape instead of a
+            # buffer built from self.num_heads.
+            topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=(
+                    attn_metadata.cp_kv_cache_interleave_size
+                ),
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
+            )
+
+            kernel_out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
+                query=q.unsqueeze(1),
+                kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
+                workspace_buffer=self._workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=topk_indices_physical.unsqueeze(1),
+                seq_lens=seq_lens,
+                max_seq_len=attn_metadata.topk_tokens,
+                bmm1_scale=self.scale,
+                bmm2_scale=1.0,
+                sparse_mla_top_k=attn_metadata.topk_tokens,
+                kv_scale_format=self.kv_scale_format,
+                return_lse=self.need_to_return_lse_for_decode,
+            )
+            if self.need_to_return_lse_for_decode:
+                assert isinstance(kernel_out, tuple)
+                o, lse = kernel_out
+            else:
+                assert isinstance(kernel_out, torch.Tensor)
+                o = kernel_out
+                lse = None
+
+            out = o.view(-1, o.shape[-2], o.shape[-1])
+            if lse is not None:
+                lse = FlashInferMLASparseImpl._normalize_lse(
+                    lse, out.shape[0], out.shape[1]
+                )
+                # Rows whose top-k entries all live on other DCP ranks must
+                # not contribute to the cross-rank combine.
+                empty_rows = (topk_indices_physical == -1).all(dim=-1)
+                out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+                lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+            return out, lse
+
         topk_indices_physical = cast(
             torch.Tensor,
             triton_convert_req_index_to_global_index(
@@ -131,13 +202,6 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         output = q.new_empty(
             (num_actual_toks, self.num_heads, self.kv_lora_rank),
             dtype=q.dtype,
-        )
-
-        if self._workspace_buffer is None:
-            self._workspace_buffer = _get_workspace_buffer(q.device)
-
-        from vllm.utils.flashinfer import (
-            flashinfer_trtllm_batch_decode_with_kv_cache_mla,
         )
 
         out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
