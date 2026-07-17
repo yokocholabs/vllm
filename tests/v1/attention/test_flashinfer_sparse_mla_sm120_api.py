@@ -9,6 +9,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
+from vllm.v1.attention.backend import MLAAttentionImpl
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
@@ -29,6 +30,12 @@ def test_sm120_backend_uses_dedicated_backend_name() -> None:
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120.get_class()
         is FlashInferMLASparseSM120Backend
     )
+
+
+def test_sm120_backend_implements_mha_prefill_path() -> None:
+    impl_cls = FlashInferMLASparseSM120Backend.get_impl_cls()
+
+    assert impl_cls.forward_mha is not MLAAttentionImpl.forward_mha
 
 
 def test_v32_glm_sm120_backend_accepts_glm_block_size(
